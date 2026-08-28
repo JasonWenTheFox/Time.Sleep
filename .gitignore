@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Local build products and logs
+build/
+outputs/
+.work/
+*.log
+
+# Local project instructions and test history
+AGENTS.md
+docs/requirements.md
+docs/testing.md
