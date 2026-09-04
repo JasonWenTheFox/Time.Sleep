@@ -6,8 +6,3 @@ build/
 outputs/
 .work/
 *.log
-
-# Local project instructions and test history
-AGENTS.md
-docs/requirements.md
-docs/testing.md
