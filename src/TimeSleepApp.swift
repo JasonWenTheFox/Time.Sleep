@@ -63,6 +63,11 @@ enum TimerPhase: Equatable {
     case paused
 }
 
+enum TimerInputMode: String {
+    case countdown
+    case scheduledTime
+}
+
 enum ReminderStrength: String {
     case standard
     case enhanced
@@ -85,6 +90,9 @@ enum DefaultsKeys {
     static let lastHours = "lastHours"
     static let lastMinutes = "lastMinutes"
     static let lastSeconds = "lastSeconds"
+    static let timerInputMode = "timerInputMode"
+    static let scheduledHour = "scheduledHour"
+    static let scheduledMinute = "scheduledMinute"
 }
 
 // MARK: - 计时核心模型
@@ -107,6 +115,9 @@ final class TimerModel: NSObject, ObservableObject, UNUserNotificationCenterDele
     @Published private(set) var permissionCheckPerformed = false
 
     private var ticker: Timer?
+    /// 连续时钟不受用户修改系统时间或时区影响，并且会跨系统休眠继续推进。
+    private let continuousClock = ContinuousClock()
+    private var continuousDeadline: ContinuousClock.Instant?
     private var fallbackSound: NSSound?
     private var fallbackReminderWorkItem: DispatchWorkItem?
     /// 让异步通知查询只能作用于发起查询时的同一轮计时，避免取消/顺延后旧回调重新发通知
@@ -182,34 +193,52 @@ final class TimerModel: NSObject, ObservableObject, UNUserNotificationCenterDele
     func start(seconds: TimeInterval) {
         guard seconds > 0 else { return }
         requestNotificationAuthorizationIfNeeded { [weak self] in
-            self?.beginTimer(seconds: seconds)
+            self?.beginTimer(duration: seconds, source: "countdown")
         }
     }
 
-    private func beginTimer(seconds: TimeInterval) {
+    func start(atLocalHour hour: Int, minute: Int) {
+        guard (0...23).contains(hour), (0...59).contains(minute) else { return }
+        requestNotificationAuthorizationIfNeeded { [weak self] in
+            guard let self = self else { return }
+            guard let target = ScheduleResolver.nextOccurrence(hour: hour, minute: minute) else {
+                self.statusMessage = L10n.t("无法计算指定时间", "無法計算指定時間", "Could not resolve the selected time")
+                return
+            }
+            self.beginTimer(duration: target.timeIntervalSinceNow,
+                            source: "scheduled-local \(String(format: "%02d:%02d", hour, minute))")
+        }
+    }
+
+    private func beginTimer(duration: TimeInterval, source: String) {
+        guard duration > 0 else { return }
         timerSessionID = UUID()
-        deadline = Date().addingTimeInterval(seconds)
-        remaining = seconds
+        let now = Date()
+        deadline = now.addingTimeInterval(duration)
+        continuousDeadline = continuousClock.now.advanced(by: .seconds(duration))
+        remaining = duration
         warned = false
         statusMessage = nil
         phase = .running
         clearReminderArtifacts()
-        log("timer started: \(action.rawValue) in \(Int(seconds))s (warn-lead \(warnLeadSeconds)s, strength \(reminderStrength.rawValue))")
+        log("timer started: \(action.rawValue) in \(Int(duration))s from \(source) (warn-lead \(warnLeadSeconds)s, strength \(reminderStrength.rawValue))")
     }
 
     func pause() {
         guard phase == .running else { return }
         timerSessionID = UUID()
-        pausedRemaining = remaining
+        pausedRemaining = max(0, continuousRemaining() ?? remaining)
+        continuousDeadline = nil
         phase = .paused
         clearReminderArtifacts()
-        log("paused at \(formatInterval(remaining))")
+        log("paused at \(formatInterval(pausedRemaining))")
     }
 
     func resume() {
         guard phase == .paused else { return }
         timerSessionID = UUID()
         deadline = Date().addingTimeInterval(pausedRemaining)
+        continuousDeadline = continuousClock.now.advanced(by: .seconds(pausedRemaining))
         remaining = pausedRemaining
         // 若恢复后已进入预警窗口则不再重复提醒
         warned = warnLeadSeconds > 0 && remaining <= TimeInterval(warnLeadSeconds)
@@ -230,10 +259,11 @@ final class TimerModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         let extra = TimeInterval(minutes * 60)
         switch phase {
         case .running:
-            guard let dl = deadline else { return }
+            guard let currentContinuousDeadline = continuousDeadline else { return }
             timerSessionID = UUID()
-            deadline = dl.addingTimeInterval(extra)
-            remaining = max(0, dl.addingTimeInterval(extra).timeIntervalSinceNow)
+            continuousDeadline = currentContinuousDeadline.advanced(by: .seconds(extra))
+            remaining = max(0, continuousRemaining() ?? (remaining + extra))
+            deadline = Date().addingTimeInterval(remaining)
             warned = false
             clearReminderArtifacts()
             log("snoozed +\(minutes)min, deadline now \(String(describing: deadline))")
@@ -264,12 +294,20 @@ final class TimerModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         }
     }
 
+    /// 根据连续计时的剩余量换算为当前系统日历中的预计执行时刻。
+    /// 用户中途修改系统时钟或时区后，倒计时不跳变，但这个展示时间会随之更新。
+    var expectedFireDate: Date? {
+        guard phase == .running else { return nil }
+        return Date().addingTimeInterval(max(0, continuousRemaining() ?? remaining))
+    }
+
     // MARK: 内部计时
 
     private func reset() {
         timerSessionID = UUID()
         phase = .idle
         deadline = nil
+        continuousDeadline = nil
         remaining = 0
         pausedRemaining = 0
         warned = false
@@ -291,11 +329,11 @@ final class TimerModel: NSObject, ObservableObject, UNUserNotificationCenterDele
     }
 
     private func tick() {
-        guard phase == .running, let dl = deadline else { return }
-        let rem = dl.timeIntervalSinceNow
+        guard phase == .running, deadline != nil,
+              let rem = continuousRemaining() else { return }
         if rem <= 0 {
             remaining = 0
-            fire()
+            fire(lateness: -rem)
             return
         }
         remaining = rem
@@ -307,8 +345,7 @@ final class TimerModel: NSObject, ObservableObject, UNUserNotificationCenterDele
         }
     }
 
-    private func fire() {
-        let lateness = -(deadline?.timeIntervalSinceNow ?? 0)
+    private func fire(lateness: TimeInterval) {
         let act = action
         reset()
         if lateness > Self.maxLatenessGrace {
@@ -326,6 +363,12 @@ final class TimerModel: NSObject, ObservableObject, UNUserNotificationCenterDele
             return
         }
         executePowerAction(act)
+    }
+
+    private func continuousRemaining() -> TimeInterval? {
+        guard let continuousDeadline = continuousDeadline else { return nil }
+        let components = continuousClock.now.duration(to: continuousDeadline).components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1e18
     }
 
     private func executePowerAction(_ act: PowerAction) {
@@ -812,6 +855,9 @@ struct PanelView: View {
     @AppStorage(DefaultsKeys.lastHours) private var hours: Int = 0
     @AppStorage(DefaultsKeys.lastMinutes) private var minutes: Int = 30
     @AppStorage(DefaultsKeys.lastSeconds) private var seconds: Int = 0
+    @AppStorage(DefaultsKeys.timerInputMode) private var timerInputModeRaw: String = TimerInputMode.countdown.rawValue
+    @AppStorage(DefaultsKeys.scheduledHour) private var scheduledHour: Int = 23
+    @AppStorage(DefaultsKeys.scheduledMinute) private var scheduledMinute: Int = 0
     @State private var settingsExpanded = false
 
     var body: some View {
@@ -858,20 +904,53 @@ struct PanelView: View {
         }
     }
 
-    // MARK: 空闲：设置时长
+    // MARK: 空闲：设置倒计时或指定时间
 
     private var idleSetup: some View {
         VStack(spacing: 12) {
-            HStack(spacing: 10) {
-                TimeColumn(value: $hours, range: 0...23, unit: L10n.t("时", "時", "hrs"))
-                TimeColumn(value: $minutes, range: 0...59, unit: L10n.t("分", "分", "min"))
-                TimeColumn(value: $seconds, range: 0...59, unit: L10n.t("秒", "秒", "sec"))
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L10n.t("计时方式", "計時方式", "Timer mode"))
+                Picker(L10n.t("计时方式", "計時方式", "Timer mode"), selection: $timerInputModeRaw) {
+                    Text(L10n.t("倒计时", "倒數計時", "Countdown")).tag(TimerInputMode.countdown.rawValue)
+                    Text(L10n.t("指定时间", "指定時間", "At Time")).tag(TimerInputMode.scheduledTime.rawValue)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: 8) {
-                presetButton(30 * 60, hans: "30 分钟", hant: "30 分鐘", en: "30 min")
-                presetButton(60 * 60, hans: "1 小时", hant: "1 小時", en: "1 hr")
-                presetButton(2 * 60 * 60, hans: "2 小时", hant: "2 小時", en: "2 hrs")
+            if timerInputMode == .countdown {
+                HStack(spacing: 10) {
+                    TimeColumn(value: $hours, range: 0...23, unit: L10n.t("时", "時", "hrs"))
+                    TimeColumn(value: $minutes, range: 0...59, unit: L10n.t("分", "分", "min"))
+                    TimeColumn(value: $seconds, range: 0...59, unit: L10n.t("秒", "秒", "sec"))
+                }
+
+                HStack(spacing: 8) {
+                    presetButton(30 * 60, hans: "30 分钟", hant: "30 分鐘", en: "30 min")
+                    presetButton(60 * 60, hans: "1 小时", hant: "1 小時", en: "1 hr")
+                    presetButton(2 * 60 * 60, hans: "2 小时", hant: "2 小時", en: "2 hrs")
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(L10n.t("执行时间", "執行時間", "Action time"))
+                    HStack {
+                        Spacer()
+                        DatePicker(L10n.t("执行时间", "執行時間", "Action time"),
+                                   selection: scheduledTimeBinding,
+                                   displayedComponents: .hourAndMinute)
+                            .labelsHidden()
+                            .frame(width: 140)
+                            .clipped()
+                    }
+                    TimelineView(.periodic(from: .now, by: 30)) { context in
+                        Text(nextScheduleDescription(relativeTo: context.date))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Picker(L10n.t("到点动作", "到點動作", "Action"), selection: $actionRaw) {
@@ -887,12 +966,17 @@ struct PanelView: View {
             }
 
             Button {
-                let total = hours * 3600 + minutes * 60 + seconds
-                guard total > 0 else {
-                    model.statusMessage = L10n.t("请先设置时长", "請先設定時長", "Set a duration first")
-                    return
+                switch timerInputMode {
+                case .countdown:
+                    let total = hours * 3600 + minutes * 60 + seconds
+                    guard total > 0 else {
+                        model.statusMessage = L10n.t("请先设置时长", "請先設定時長", "Set a duration first")
+                        return
+                    }
+                    model.start(seconds: TimeInterval(total))
+                case .scheduledTime:
+                    model.start(atLocalHour: scheduledHour, minute: scheduledMinute)
                 }
-                model.start(seconds: TimeInterval(total))
             } label: {
                 Text(L10n.t("开始计时", "開始計時", "Start Timer"))
                     .frame(maxWidth: .infinity)
@@ -919,7 +1003,7 @@ struct PanelView: View {
             Text(model.displayRemaining)
                 .font(.system(size: 44, weight: .semibold, design: .rounded))
                 .monospacedDigit()
-            Text("\(L10n.t("到点后", "到點後", "Will")) \(currentActionLabel) · \(warnLeadDesc)")
+            Text(runningDescription)
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -1062,6 +1146,73 @@ struct PanelView: View {
     }
 
     // MARK: 辅助
+
+    private var timerInputMode: TimerInputMode {
+        TimerInputMode(rawValue: timerInputModeRaw) ?? .countdown
+    }
+
+    private var scheduledTimeBinding: Binding<Date> {
+        Binding(
+            get: {
+                Calendar.autoupdatingCurrent.date(bySettingHour: scheduledHour,
+                                                  minute: scheduledMinute,
+                                                  second: 0,
+                                                  of: Date()) ?? Date()
+            },
+            set: { newValue in
+                let components = Calendar.autoupdatingCurrent.dateComponents([.hour, .minute], from: newValue)
+                scheduledHour = components.hour ?? scheduledHour
+                scheduledMinute = components.minute ?? scheduledMinute
+            }
+        )
+    }
+
+    private var runningDescription: String {
+        let target = model.expectedFireDate.map { targetTimeText($0) }
+            ?? L10n.t("未知时间", "未知時間", "unknown time")
+        return L10n.t("预计 \(target) · \(currentActionLabel) · \(warnLeadDesc)",
+                      "預計 \(target) · \(currentActionLabel) · \(warnLeadDesc)",
+                      "Expected \(target) · \(currentActionLabel) · \(warnLeadDesc)")
+    }
+
+    private func nextScheduleDescription(relativeTo now: Date) -> String {
+        guard let target = ScheduleResolver.nextOccurrence(hour: scheduledHour,
+                                                            minute: scheduledMinute,
+                                                            after: now) else {
+            return L10n.t("无法计算下一次时间", "無法計算下一次時間", "Could not resolve the next time")
+        }
+        return L10n.t("下一次：\(targetTimeText(target, relativeTo: now))",
+                      "下一次：\(targetTimeText(target, relativeTo: now))",
+                      "Next: \(targetTimeText(target, relativeTo: now))")
+    }
+
+    private func targetTimeText(_ date: Date, relativeTo now: Date = Date()) -> String {
+        let calendar = Calendar.autoupdatingCurrent
+        let time = localizedTime(date)
+        if calendar.isDate(date, inSameDayAs: now) {
+            return L10n.t("今天 \(time)", "今日 \(time)", "today at \(time)")
+        }
+        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
+           calendar.isDate(date, inSameDayAs: tomorrow) {
+            return L10n.t("明天 \(time)", "明日 \(time)", "tomorrow at \(time)")
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private func localizedTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.timeZone = .autoupdatingCurrent
+        // `j` follows the user's 12/24-hour system preference and adds AM/PM when appropriate.
+        formatter.setLocalizedDateFormatFromTemplate("j:mm")
+        return formatter.string(from: date)
+    }
 
     private var currentActionLabel: String {
         (PowerAction(rawValue: actionRaw) ?? .sleep).label

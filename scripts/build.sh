@@ -28,11 +28,11 @@ iconutil -c icns build/AppIcon.iconset -o build/AppIcon.icns
 echo "[2/5] generating alert sound..."
 swift scripts/gen_alert_sound.swift build/TimeSleepAlert.wav
 
-# 3. 编译（Swift 5 语言模式；单文件含 @main 需要 -parse-as-library；最低 macOS 14）
+# 3. 编译（Swift 5 语言模式；含 @main 需要 -parse-as-library；最低 macOS 14）
 echo "[3/5] compiling..."
 swiftc -O -swift-version 5 -parse-as-library \
   -target arm64-apple-macosx14.0 \
-  -o build/TimeSleep src/TimeSleepApp.swift
+  -o build/TimeSleep src/ScheduleResolver.swift src/TimeSleepApp.swift
 
 # 4. 组装 .app
 echo "[4/5] assembling bundle..."

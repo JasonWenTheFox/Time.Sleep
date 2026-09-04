@@ -17,6 +17,11 @@ esac
 
 scripts/build.sh
 
+swiftc -O -swift-version 5 -parse-as-library \
+  -o build/ScheduleResolverTests \
+  src/ScheduleResolver.swift scripts/test_schedule.swift
+build/ScheduleResolverTests
+
 APP="outputs/Time.Sleep.app"
 EXECUTABLE="$APP/Contents/MacOS/TimeSleep"
 

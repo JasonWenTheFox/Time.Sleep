@@ -2,13 +2,14 @@
 
 [简体中文](README.zh-CN.md)
 
-Time.Sleep is a small macOS menu bar timer that puts your Mac to sleep or shuts it down when the countdown ends. It stays out of the Dock, shows the remaining time in the menu bar, and warns you before the scheduled action.
+Time.Sleep is a small macOS menu bar timer that puts your Mac to sleep or shuts it down after a countdown or at a chosen local time. It stays out of the Dock, shows the remaining time in the menu bar, and warns you before the scheduled action.
 
 ![Time.Sleep in English](assets/screenshot-en.png)
 
 ## Features
 
-- Sleep or shut down after a configurable countdown
+- Sleep or shut down after a configurable countdown or at a chosen local time
+- Local-time picker that follows the Mac's 12/24-hour setting and automatically uses the next occurrence of the selected time
 - Hours, minutes, and seconds controls, plus 30-minute, 1-hour, and 2-hour presets
 - Configurable advance warning from 30 seconds to 10 minutes
 - Standard and enhanced reminders; enhanced mode uses a custom sound and a second reminder after 15 seconds
@@ -45,11 +46,13 @@ Current community builds are ad-hoc signed and are not notarized by Apple. macOS
 ## Use
 
 1. Click the moon icon in the menu bar.
-2. Set a duration or choose a preset.
+2. Choose **Countdown** and set a duration, or choose **At Time** and select a local clock time.
 3. Select **Sleep** or **Shut Down**.
 4. Click **Start Timer**.
 
-The menu bar displays the remaining time while the timer is active. The panel provides controls to pause, resume, cancel, postpone by 10 minutes, or perform the selected action immediately.
+For **At Time**, a time later today means today; a time that has already passed means tomorrow. The picker follows the Mac's current locale and 12/24-hour setting. Once started, the target is converted to a continuous countdown, so later clock or time-zone changes do not unexpectedly shorten or extend it.
+
+The menu bar displays the remaining time while the timer is active. The panel also shows the expected local action time and provides controls to pause, resume, cancel, postpone by 10 minutes, or perform the selected action immediately.
 
 Open **Settings** in the panel to change the warning time and reminder strength, preview a reminder, check permissions, or enable launch at login.
 
@@ -93,6 +96,8 @@ scripts/package-release.sh
 ## Safety notes
 
 - A timer is kept in memory and is lost when Time.Sleep quits or the Mac logs out.
+- Changing the system clock or time zone after starting a timer does not change its remaining duration; the displayed expected local action time updates instead.
+- If a selected local time does not exist during a daylight-saving transition, Time.Sleep uses the next valid local time. If it occurs twice, the first occurrence is used.
 - If the Mac sleeps through the deadline by more than two minutes, Time.Sleep skips the action after wake instead of immediately sleeping or shutting down.
 - If shutdown Automation permission is denied, enable Time.Sleep under **System Settings → Privacy & Security → Automation**.
 - The app cannot override Focus, notification settings, mute state, or the system volume.
